@@ -219,12 +219,199 @@ def fetch_tushare_by_date(
     return pd.concat(all_frames, ignore_index=True)
 
 
+# ===========================================================================
+# 【可插拔因子框架】— 以后加因子就注册到 FACTOR_REGISTRY
+# ===========================================================================
+#
+# 因子分两类:
+#   1. COMPUTED — 从已有 OHLCV/amount 现算, 不需要额外 API 调用
+#   2. TUSHARE  — 需要额外调 Tushare pro_api 某个接口
+#
+# 用法:
+#   # 只用内置因子
+#   normalize_to_qlib_csv(df, output_dir, factors=["vwap", "ret_1d", "pe"])
+#
+#   # 注册你自己的因子 (一行搞定)
+#   @register_factor("my_alpha")
+#   def _(df): return df["close"].shift(1) / df["close"] - 1
+#
+#   # 或者写一个 Tushare API 因子
+#   @register_factor("top10_holder", tushare_api="stk_holdernumber",
+#                    tushare_fields=["holdernum"], key_col="ts_code")
+#   def _(api_df, base_df):
+#       return api_df.set_index(["ts_code","trade_date"])["holdernum"]
+# ===========================================================================
+
+# 因子注册表: name -> callable 或 dict
+FACTOR_REGISTRY: dict[str, callable | dict] = {}
+
+
+def register_factor(name: str, tushare_api: str | None = None,
+                    tushare_fields: list | None = None,
+                    key_col: str = "ts_code"):
+    """
+    注册一个因子。两种写法:
+
+    # 1. 纯计算因子 (从已有 OHLCV 算)
+    @register_factor("vwap")
+    def _(df):  # df = 单只股票 + 基础列 (close, volume, amount...)
+        return df["amount"] / df["volume"].replace(0, np.nan)
+
+    # 2. 需要额外 Tushare API 的因子
+    @register_factor("pe_ttm", tushare_api="daily_basic",
+                     tushare_fields=["pe_ttm"])
+    def _(api_df, base_df):  # api_df = pro.daily_basic() 返回, base_df = 基础列
+        return api_df["pe_ttm"]
+    """
+    def _decorator(func):
+        entry = {"compute": func}
+        if tushare_api:
+            entry["tushare_api"] = tushare_api
+            entry["tushare_fields"] = tushare_fields or []
+            entry["key_col"] = key_col
+        FACTOR_REGISTRY[name] = entry
+        return func
+    return _decorator
+
+
+# ===========================================================================
+# 【内置因子库】— 你想加新的就在这里 @register_factor
+# ===========================================================================
+
+# --- 第 1 类: 从基础 OHLCV/amount 直接算 ---
+
+@register_factor("vwap")
+def _(df):
+    """VWAP = amount / volume (社区 investment_data 里用的就是这个)"""
+    vol = df["volume"].replace(0, np.nan)
+    return (df["amount"] / vol).ffill()
+
+
+@register_factor("ret_1d")
+def _(df):
+    """1 日收益率 (forward-looking, 不含当日)"""
+    return df["close"].pct_change(1)
+
+
+@register_factor("ret_5d")
+def _(df):
+    """5 日收益率"""
+    return df["close"].pct_change(5)
+
+
+@register_factor("ret_20d")
+def _(df):
+    """20 日收益率"""
+    return df["close"].pct_change(20)
+
+
+@register_factor("vol_20d")
+def _(df):
+    """20 日收益率标准差 (波动率)"""
+    return df["close"].pct_change().rolling(20).std()
+
+
+@register_factor("hl_ratio")
+def _(df):
+    """振幅比 (high - low) / close"""
+    return (df["high"] - df["low"]) / df["close"]
+
+
+@register_factor("co_ratio")
+def _(df):
+    """收盘位置 (close - low) / (high - low)"""
+    denom = (df["high"] - df["low"]).replace(0, np.nan)
+    return (df["close"] - df["low"]) / denom
+
+
+# --- 第 2 类: 需要额外 Tushare API (以后 token 有效时自动生效) ---
+
+@register_factor("pe_ttm", tushare_api="daily_basic", tushare_fields=["pe_ttm"])
+def _(api_df, base_df):
+    """滚动市盈率 (Tushare pro.daily_basic.pe_ttm)"""
+    return api_df["pe_ttm"]
+
+
+@register_factor("pb", tushare_api="daily_basic", tushare_fields=["pb"])
+def _(api_df, base_df):
+    """市净率"""
+    return api_df["pb"]
+
+
+@register_factor("circ_mv", tushare_api="daily_basic", tushare_fields=["circ_mv"])
+def _(api_df, base_df):
+    """流通市值 (万元)"""
+    return api_df["circ_mv"]
+
+
+@register_factor("turnover", tushare_api="daily_basic", tushare_fields=["turnover_rate"])
+def _(api_df, base_df):
+    """换手率 (%)"""
+    return api_df["turnover_rate"]
+
+
+@register_factor("net_mf", tushare_api="moneyflow",
+                 tushare_fields=["buy_sm_amount", "sell_sm_amount"])
+def _(api_df, base_df):
+    """主力资金净流入 (万元)"""
+    return api_df["buy_sm_amount"] - api_df["sell_sm_amount"]
+
+
+# ===========================================================================
+# 因子注册结束 — 以后 @register_factor("xxx") 就能加
+# ===========================================================================
+
+
+def _fetch_tushare_extra_factors(
+    symbols: list[str],
+    start_date: str,
+    end_date: str,
+    factor_names: list[str],
+    token: str | None = None,
+) -> dict[str, pd.DataFrame]:
+    """
+    批量拉取需要额外 Tushare API 的因子数据。
+    返回: {api_name: merged_df} — 一次性拉, 避免重复 API 调用
+    """
+    pro = _get_tushare_pro(token)
+    apis_needed = {}
+    for name in factor_names:
+        entry = FACTOR_REGISTRY[name]
+        if "tushare_api" in entry:
+            api = entry["tushare_api"]
+            apis_needed.setdefault(api, set()).update(entry["tushare_fields"])
+
+    if not apis_needed:
+        return {}
+
+    print(f"   📡 额外拉 Tushare API: {list(apis_needed.keys())} ...")
+    results = {}
+    for api_name, fields in apis_needed.items():
+        all_frames = []
+        for ts_code in symbols:
+            try:
+                method = getattr(pro, api_name)
+                df = method(ts_code=ts_code, start_date=start_date, end_date=end_date,
+                            fields="ts_code,trade_date," + ",".join(fields))
+                all_frames.append(df)
+                time.sleep(0.3)
+            except Exception as e:
+                print(f"      ⚠️  {api_name} {ts_code} 失败: {e}")
+        if all_frames:
+            results[api_name] = pd.concat(all_frames, ignore_index=True)
+            print(f"      ✅ {api_name}: {len(results[api_name])} 行")
+
+    return results
+
+
 # --- Qlib 格式标准化 ---
 def normalize_to_qlib_csv(
     df: pd.DataFrame,
     output_dir: Path,
     fields: str = "date,open,high,low,close,volume,factor,amount",
     manual_adj: bool = True,
+    factors: list[str] | None = None,
+    extra_factor_data: dict[str, pd.DataFrame] | None = None,
 ) -> set:
     """
     把 Tushare 原始 DataFrame 标准化成 Qlib 多文件 CSV 格式。
@@ -233,6 +420,7 @@ def normalize_to_qlib_csv(
       1. factor = adjclose / close
       2. OHLC = OHLC × factor, volume = volume / factor
       3. _manual_adj_data: 按首日 close 归一化（Qlib 离线因子训练需要）
+      4. 附加 factors 列表中的因子 (从 FACTOR_REGISTRY 自动加载)
 
     Parameters
     ----------
@@ -242,9 +430,13 @@ def normalize_to_qlib_csv(
     output_dir : Path
         输出目录 (多文件模式, 文件名 = qlib_symbol.csv, 无 symbol 列)
     fields : str
-        要输出的字段
+        基础输出字段
     manual_adj : bool
         是否做首日 close 归一化 (默认 True, 与官方 Normalize 一致)
+    factors : list[str]
+        额外因子名列表, 从 FACTOR_REGISTRY 加载. 例: ["vwap", "pe_ttm", "vol_20d"]
+    extra_factor_data : dict[str, pd.DataFrame]
+        需要额外 Tushare API 的因子数据, {api_name: df}. 由 _fetch_tushare_extra_factors 拉好传入.
 
     Returns
     -------
@@ -253,6 +445,13 @@ def normalize_to_qlib_csv(
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     field_list = [f.strip() for f in fields.split(",")]
+    factors = factors or []
+    extra_factor_data = extra_factor_data or {}
+
+    # 验证因子名
+    for name in factors:
+        if name not in FACTOR_REGISTRY:
+            raise ValueError(f"未知因子: {name!r}. 已注册: {list(FACTOR_REGISTRY)}")
 
     qlib_symbols = set()
 
@@ -286,8 +485,31 @@ def normalize_to_qlib_csv(
                     out[col] = out[col] / first_close
                 out["volume"] = out["volume"] * first_close
 
-        # 选取输出字段
-        out = out[field_list]
+        # --- 计算额外因子 ---
+        for name in factors:
+            entry = FACTOR_REGISTRY[name]
+            func = entry["compute"]
+
+            if "tushare_api" not in entry:
+                # 纯计算因子: 给复权后的 OHLCV + amount
+                out[name] = func(out.copy())
+            else:
+                # Tushare API 因子: 从 extra_factor_data 取
+                api_name = entry["tushare_api"]
+                if api_name in extra_factor_data:
+                    api_df = extra_factor_data[api_name]
+                    sub = api_df[api_df["ts_code"] == ts_code].copy()
+                    if not sub.empty:
+                        sub["date"] = pd.to_datetime(sub["trade_date"], format="%Y%m%d").dt.strftime("%Y-%m-%d")
+                        merged = out.merge(sub[["date"] + entry["tushare_fields"]], on="date", how="left")
+                        out[name] = merged[entry["tushare_fields"][0]]  # 第 1 个 field
+                        # 如果有多个 field (如 net_mf), 调一次多参数版本
+                        if len(entry["tushare_fields"]) > 1:
+                            out[name] = func(merged, out)
+
+        # 选取输出字段 + 因子列
+        final_cols = field_list + factors
+        out = out[final_cols]
 
         qlib_symbol = ts_code_to_qlib(ts_code)
         out.to_csv(output_dir / f"{qlib_symbol}.csv", index=False)
