@@ -290,11 +290,11 @@ def _dump(all_df: pd.DataFrame, qdir: Path, freq: str, market: str,
             delta = (new_end - old_end_sym).days
             print(f"   {tag} {sym}  date_index={date_index}  新增≈{delta}天")
 
-    # instruments/all.txt
+    # instruments/all.txt  — symbol 用大写（与官方 dump_bin.py 输出一致）
     (qdir / "instruments").mkdir(parents=True, exist_ok=True)
     with open(qdir / "instruments" / f"{market}.txt", "w", encoding="utf-8") as f:
         for sym, s, e in inst_lines:
-            f.write(f"{sym}\t{s}\t{e}\n")
+            f.write(f"{sym.upper()}\t{s}\t{e}\n")
 
     print(f"💾 股票总数={len(inst_lines)}")
     print(f"✅ qlib 数据已写入: {qdir.resolve()}")
